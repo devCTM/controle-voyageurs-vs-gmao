@@ -1,0 +1,14 @@
+[browser]
+# Pas d'envoi de statistiques d'usage à Streamlit
+gatherUsageStats = false
+
+[server]
+# Taille maximale d'un fichier déposé (Mo)
+maxUploadSize = 50
+enableXsrfProtection = true
+
+[client]
+# Pas de détails techniques (qui pourraient contenir des extraits de données) à l'écran
+showErrorDetails = "none"
+# Menu simplifié pour les utilisateurs
+toolbarMode = "viewer"
