@@ -8,6 +8,7 @@ import io
 import re
 import unicodedata
 
+import altair as alt
 import ftfy
 import pandas as pd
 from openpyxl import load_workbook
@@ -469,6 +470,77 @@ def rapprochement(gmao, voy, log):
 
 
 # =========================
+# SYNTHÈSE DU TB PAR FEUILLE (lue directement dans le fichier TB de correspondance)
+# =========================
+def synthese_tb(tb_bytes):
+    """Pour chaque feuille utilisée du TB (les mêmes que la consolidation : 2e à 10e) :
+    nombre de NUM_CMDE_AN distincts et somme de PRIX_TOTAL_HT. Ne touche pas au traitement principal."""
+    xls = pd.ExcelFile(io.BytesIO(tb_bytes))
+    lignes = []
+    for feuille in xls.sheet_names[1:10]:
+        df = pd.read_excel(xls, sheet_name=feuille)
+        df.columns = df.columns.astype(str).str.strip()
+        df = df.reindex(columns=["NUM_CMDE_AN", "PRIX_TOTAL_HT"]).dropna(how="all")
+        df = _fix_num(df)   # 1.0 et 1 comptent pour une seule commande
+        montant = pd.to_numeric(df["PRIX_TOTAL_HT"], errors="coerce")
+        lignes.append({
+            "FEUILLE": feuille,
+            "NB_COMMANDES": int(df["NUM_CMDE_AN"].nunique()),
+            "TOTAL_HT": float(montant.sum()),
+        })
+    return pd.DataFrame(lignes, columns=["FEUILLE", "NB_COMMANDES", "TOTAL_HT"])
+
+
+# =========================
+# ANALYSE DES NOUVELLES LIGNES (section « Analyse » de la page Détection)
+# =========================
+def analyser_nouvelles(resultat_bytes, voy):
+    """Analyse la feuille « Nouvelles lignes » de resultat.xlsx. N'altère aucun calcul de l'audit.
+
+    - lignes        : les nouvelles lignes, avec la feuille du TB rattachée à leur commande (colonne FEUILLE) ;
+    - total_ht      : somme de PRIX_TOTAL_HT sur toutes les nouvelles lignes ;
+    - nb_commandes  : nombre de NUM_CMDE_AN distincts ;
+    - par_feuille   : par feuille, nombre de commandes distinctes, nombre de lignes et somme de PRIX_TOTAL_HT.
+
+    La GMAO n'a pas de notion de feuille : la feuille d'une nouvelle ligne est celle où le TB contient déjà ce
+    NUM_CMDE_AN (cas d'un article ajouté à une commande connue). Une commande totalement nouvelle n'est dans
+    aucune feuille du TB : elle n'a pas de feuille (FEUILLE vide) et n'entre pas dans le regroupement par feuille.
+    """
+    lignes = pd.read_excel(io.BytesIO(resultat_bytes), sheet_name="Nouvelles lignes")
+    lignes = _fix_num(lignes)
+    lignes["PRIX_TOTAL_HT"] = pd.to_numeric(lignes["PRIX_TOTAL_HT"], errors="coerce")
+
+    feuille_par_cmde = voy.drop_duplicates("NUM_CMDE_AN").set_index("NUM_CMDE_AN")["SOURCE_FEUILLE"]
+    lignes.insert(1, "FEUILLE", lignes["NUM_CMDE_AN"].map(feuille_par_cmde))   # vide si commande absente du TB
+
+    par_feuille = (
+        lignes.groupby("FEUILLE")
+        .agg(NB_COMMANDES=("NUM_CMDE_AN", "nunique"), NB_LIGNES=("NUM_CMDE_AN", "size"),
+             TOTAL_HT=("PRIX_TOTAL_HT", "sum"))
+        .reset_index()
+        .sort_values("TOTAL_HT", ascending=False)
+        .reset_index(drop=True)
+    )
+    audit_df = pd.read_excel(io.BytesIO(resultat_bytes), sheet_name="Audit complet")
+    types = audit_df["Type"].fillna("").astype(str) if "Type" in audit_df.columns else pd.Series([], dtype=str)
+    changements_par_type = pd.DataFrame({
+        "TYPE": ["État", "Fournisseur", "Quantité", "Prix"],
+        "NB": [int(types.str.contains(t, regex=False).sum())
+               for t in ("Changement d'état", "Changement Fournisseur", "Changement QTE", "Changement PRIX")],
+    })
+    return {
+        "changements_par_type": changements_par_type,
+        "lignes": lignes,
+        "total_ht": float(lignes["PRIX_TOTAL_HT"].sum()),
+        "nb_commandes": int(lignes["NUM_CMDE_AN"].nunique()),
+        "nb_sans_montant": int(lignes["PRIX_TOTAL_HT"].isna().sum()),
+        "nb_sans_feuille": int(lignes["FEUILLE"].isna().sum()),
+        "montant_sans_feuille": float(lignes.loc[lignes["FEUILLE"].isna(), "PRIX_TOTAL_HT"].sum()),
+        "par_feuille": par_feuille,
+    }
+
+
+# =========================
 # POINT D'ENTRÉE
 # =========================
 def run(tb_bytes, cmd_bytes, log=print):
@@ -480,8 +552,11 @@ def run(tb_bytes, cmd_bytes, log=print):
     # L'audit modifie gmao et voy en place : on repart de copies neuves
     gmao, voy = charger(voy_bytes, gmao_bytes)
     rapproch, nb_rapproch = rapprochement(gmao, voy, log)
+    analyse = analyser_nouvelles(resultat, voy)
+    analyse["synthese_tb"] = synthese_tb(tb_bytes)
 
     return {
+        "analyse": analyse,
         "resultat": resultat,
         "rapprochement": rapproch,
         "nb_changements": nb_changements,
@@ -965,6 +1040,39 @@ def preparer_export_changements(changements):
     return changements
 
 
+def calculer_kpi_suivi(nouvelles, changements, cfg, nb_lignes_bdd):
+    """Indicateurs affichés sur la page Suivi, calculés sur les résultats bruts (avant mise en forme de l'export).
+
+    Un écart = valeur du TB - valeur du suivi (positif : le TB est plus élevé que le suivi).
+    """
+    champ_bdd = {tb_col: bdd_col for tb_col, bdd_col, _ in cfg.champs_a_comparer}
+    champ_montant, champ_qte = champ_bdd.get("PRIX_TOTAL_HT"), champ_bdd.get("QTE_CMDEE")
+
+    montant_nouvelles = 0.0
+    if len(nouvelles) and "PRIX_TOTAL_HT" in nouvelles.columns:
+        montant_nouvelles = float(convertir_numerique(nouvelles["PRIX_TOTAL_HT"]).sum())
+
+    kpi = {"montant_nouvelles": montant_nouvelles, "ecart_montant": 0.0, "ecart_qte": 0.0,
+           "commandes_touchees": 0, "lignes_en_changement": 0, "taux_changement": 0.0, "plus_gros_ecart": None}
+    if not len(changements):
+        return kpi
+
+    ecart = (convertir_numerique(changements["Valeur_TB"]).fillna(0.0)
+             - convertir_numerique(changements["Valeur_BDD"]).fillna(0.0))
+    est_montant = changements["Champ"] == champ_montant
+    est_qte = changements["Champ"] == champ_qte
+    kpi["ecart_montant"] = float(ecart[est_montant].sum())
+    kpi["ecart_qte"] = float(ecart[est_qte].sum())
+    kpi["commandes_touchees"] = int(changements[cfg.col_tb].nunique())
+    kpi["lignes_en_changement"] = int(len(changements[[cfg.col_tb, cfg.col_titre_tb]].drop_duplicates()))
+    if nb_lignes_bdd:
+        kpi["taux_changement"] = kpi["lignes_en_changement"] / nb_lignes_bdd * 100
+    if est_montant.any():
+        i = ecart[est_montant].abs().idxmax()
+        kpi["plus_gros_ecart"] = {"valeur": float(ecart[i]), "commande": str(changements.loc[i, cfg.col_tb])}
+    return kpi
+
+
 def executer_suivi(tb_bytes, bdd_bytes, profil, annee=2026, feuille_bdd="BDD 2026"):
     """Traitement complet. Renvoie le fichier de résultat (octets), les statistiques et le journal."""
     log = Journal()
@@ -998,6 +1106,7 @@ def executer_suivi(tb_bytes, bdd_bytes, profil, annee=2026, feuille_bdd="BDD 202
         "commandes_distinctes": int(nb_commandes_distinctes),
         "changements": len(changements),
         "repartition": repartition,
+        "kpi": calculer_kpi_suivi(nouvelles_tb, changements, cfg, len(bdd)),
     }
     return {
         "xlsx": sortie.getvalue(),
@@ -1043,19 +1152,21 @@ CSS_CONNEXION = """
 <style>
 [data-testid="stApp"] { background: #faf9f6; }
 [data-testid="stHeader"] { background: transparent; }
-[data-testid="stMainBlockContainer"] { max-width: 540px; padding-top: 3.5rem; }
+[data-testid="stMainBlockContainer"] { max-width: 700px; padding-top: 3.5rem; }
 .cx-entete { text-align: center; margin-bottom: 1.6rem; }
 .cx-icone { width: 90px; height: 90px; margin: 0 auto 1.2rem; border-radius: 24px; font-size: 2.6rem;
   display: flex; align-items: center; justify-content: center; color: #fff;
   background: linear-gradient(135deg, #4aa8f0, #1a7fd6); box-shadow: 0 12px 32px rgba(26,140,220,.30); }
-.cx-entete h1 { font-family: Georgia, "Palatino Linotype", serif; font-weight: 400; font-size: 2.6rem;
+.cx-entete h1 { font-family: Georgia, "Palatino Linotype", serif; font-weight: 400; font-size: 2.4rem; white-space: nowrap;
   color: #1a1a1a; margin: 0; padding: 0; }
 .cx-entete p { color: #6b6b6b; font-size: 1.05rem; margin: .6rem 0 0; }
 [data-testid="stForm"] { background: #fff; border: 1px solid #ece9e2; border-radius: 24px;
   padding: 2rem 2.2rem; box-shadow: 0 10px 40px rgba(0,0,0,.06); }
 [data-testid="stForm"] label p { color: #333; font-weight: 500; }
-[data-testid="stForm"] input { border-radius: 12px; }
-[data-testid="stFormSubmitButton"] button { width: 100%; height: 3.2rem; border: 0; border-radius: 14px;
+[data-testid="stForm"] [data-testid="stTextInputRootElement"] { background: #fff !important; border: 1px solid #d9d6cc !important; border-radius: 12px; }
+[data-testid="stForm"] [data-testid="stElementContainer"]:has([data-testid="stFormSubmitButton"]) { width: 100% !important; }
+[data-testid="stFormSubmitButton"], [data-testid="stFormSubmitButton"] > div { width: 100% !important; display: block; }
+[data-testid="stFormSubmitButton"] button { width: 100% !important; height: 3.2rem; border: 0; border-radius: 14px;
   background: #1a8cdc; color: #fff; font-weight: 500; }
 [data-testid="stFormSubmitButton"] button:hover { background: #1678bd; color: #fff; }
 .cx-pied { text-align: center; color: #9a9a90; font-size: .9rem; margin-top: 1.6rem; }
@@ -1187,7 +1298,7 @@ def terminer_traitement(espace, res):
 # PAGE 1 : Détection TB et commandes (TB de correspondance vs GMAO)
 # ==========================================================
 COLS_TB_OBLIGATOIRES = ["NUM_CMDE_AN", "TITRE_CMDE", "TITRE", "DES_ETAT_CMDE", "DATE_CMDE"]
-COLS_TB_OPTIONNELLES = ["NOM", "QTE_CMDEE", "PRIXHT_LIGNE_CMDE", "DES_MAGASIN"]
+COLS_TB_OPTIONNELLES = ["NOM", "QTE_CMDEE", "PRIXHT_LIGNE_CMDE", "PRIX_TOTAL_HT", "DES_MAGASIN"]
 COLS_GMAO_OBLIGATOIRES = ["NUM_CMDE_AN", "TITRE_CMDE", "TITRE", "DES_ETAT_CMDE", "DATE_CMDE"]
 COLS_GMAO_OPTIONNELLES = ["NOM", "QTE_CMDEE", "PRIXHT_LIGNE_CMDE", "PRIX_TOTAL_HT", "TOTALHT", "TOTALTVA",
                           "TYPE_LIGNE_CMDE", "DES_FAMILLE_FOURN", "DES_MAGASIN"]
@@ -1234,13 +1345,196 @@ def verifier_colonnes(tb_bytes, cmd_bytes):
     return erreurs, avertissements
 
 
+def fmt_montant(x):
+    """1234567.8 -> « 1 234 567,80 » (format français)."""
+    return f"{x:,.2f}".replace(",", " ").replace(".", ",")
+
+
+def fmt_ecart(x):
+    """Écart signé au format français : +1 234,50 / −300 / 0."""
+    if abs(x) < 1e-9:
+        return "0"
+    texte = fmt_montant(abs(x)) if abs(x) % 1 > 1e-9 else f"{abs(x):,.0f}".replace(",", " ")
+    return ("+" if x > 0 else "−") + texte
+
+
+def section_indicateurs(a):
+    """Indicateurs complémentaires : KPI et graphiques sur les changements et les nouvelles lignes."""
+    lignes, synthese = a["lignes"], a["synthese_tb"]
+    st.markdown("**Indicateurs complémentaires**")
+
+    total_tb = float(synthese["TOTAL_HT"].sum())
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Montant total du TB", fmt_montant(total_tb))
+    if not lignes.empty:
+        part = (a["total_ht"] / total_tb * 100) if total_tb else 0.0
+        k2.metric("Nouveaux montants / montant du TB", f"{part:.1f} %".replace(".", ","))
+        k3.metric("Montant moyen par nouvelle ligne", fmt_montant(a["total_ht"] / len(lignes)))
+        par_cmde = lignes.groupby("NUM_CMDE_AN")["PRIX_TOTAL_HT"].sum()
+        k4.metric("Plus grosse nouvelle commande", fmt_montant(float(par_cmde.max())),
+                  help=f"Commande {par_cmde.idxmax()}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Changements détectés par type**")
+        ch = a["changements_par_type"]
+        if ch["NB"].sum() == 0:
+            st.info("Aucun changement détecté.")
+        else:
+            st.altair_chart(
+                alt.Chart(ch).mark_bar().encode(
+                    x=alt.X("TYPE:N", title=None, sort=list(ch["TYPE"]), axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("NB:Q", title="Lignes", axis=alt.Axis(tickMinStep=1)),
+                    color=alt.Color("TYPE:N", legend=None, scale=alt.Scale(
+                        domain=["État", "Fournisseur", "Quantité", "Prix"],
+                        range=["#FFC000", "#00B0F0", "#FFAEC9", "#FF99CC"])),
+                    tooltip=[alt.Tooltip("TYPE:N", title="Type"), alt.Tooltip("NB:Q", title="Lignes", format="d")],
+                ).properties(height=300),
+                width="stretch")
+            st.caption("Une ligne qui cumule plusieurs changements est comptée dans chaque type.")
+    with c2:
+        st.markdown("**Nouvelles lignes par état de commande**")
+        if lignes.empty or "DES_ETAT_CMDE" not in lignes.columns:
+            st.info("Aucune nouvelle ligne.")
+        else:
+            etat = (lignes.assign(DES_ETAT_CMDE=lignes["DES_ETAT_CMDE"].fillna("(sans état)"))
+                    .groupby("DES_ETAT_CMDE", as_index=False)
+                    .agg(TOTAL_HT=("PRIX_TOTAL_HT", "sum"), NB_LIGNES=("NUM_CMDE_AN", "size")))
+            st.altair_chart(
+                alt.Chart(etat).mark_bar(color="#8b5cf6").encode(
+                    y=alt.Y("DES_ETAT_CMDE:N", title=None, sort="-x", axis=alt.Axis(labelLimit=180)),
+                    x=alt.X("TOTAL_HT:Q", title="Montant HT"),
+                    tooltip=[alt.Tooltip("DES_ETAT_CMDE:N", title="État"),
+                             alt.Tooltip("TOTAL_HT:Q", title="Montant HT", format=",.2f"),
+                             alt.Tooltip("NB_LIGNES:Q", title="Lignes", format="d")],
+                ).properties(height=300),
+                width="stretch")
+
+    if lignes.empty:
+        return
+    c3, c4 = st.columns(2)
+    with c3:
+        st.markdown("**Évolution mensuelle des nouvelles lignes**")
+        dates = pd.to_datetime(lignes["DATE_CMDE"], errors="coerce") if "DATE_CMDE" in lignes.columns else pd.Series(dtype="datetime64[ns]")
+        mois = (lignes.assign(MOIS=dates.dt.to_period("M").astype(str)).loc[dates.notna()]
+                .groupby("MOIS", as_index=False)
+                .agg(TOTAL_HT=("PRIX_TOTAL_HT", "sum"), NB_LIGNES=("NUM_CMDE_AN", "size")))
+        if mois.empty:
+            st.info("Aucune date de commande exploitable.")
+        else:
+            st.altair_chart(
+                alt.Chart(mois).mark_bar(color="#10b981").encode(
+                    x=alt.X("MOIS:O", title="Mois de commande", axis=alt.Axis(labelAngle=-30)),
+                    y=alt.Y("TOTAL_HT:Q", title="Montant HT"),
+                    tooltip=[alt.Tooltip("MOIS:O", title="Mois"),
+                             alt.Tooltip("TOTAL_HT:Q", title="Montant HT", format=",.2f"),
+                             alt.Tooltip("NB_LIGNES:Q", title="Lignes", format="d")],
+                ).properties(height=300),
+                width="stretch")
+    with c4:
+        st.markdown("**Top 10 des nouvelles commandes par montant**")
+        top = (lignes.assign(CMDE=lignes["NUM_CMDE_AN"].astype(str))
+               .groupby("CMDE", as_index=False)
+               .agg(TOTAL_HT=("PRIX_TOTAL_HT", "sum"), NB_LIGNES=("NUM_CMDE_AN", "size"))
+               .nlargest(10, "TOTAL_HT"))
+        st.altair_chart(
+            alt.Chart(top).mark_bar(color="#f97316").encode(
+                y=alt.Y("CMDE:N", title="Commande", sort="-x"),
+                x=alt.X("TOTAL_HT:Q", title="Montant HT"),
+                tooltip=[alt.Tooltip("CMDE:N", title="Commande"),
+                         alt.Tooltip("TOTAL_HT:Q", title="Montant HT", format=",.2f"),
+                         alt.Tooltip("NB_LIGNES:Q", title="Lignes", format="d")],
+            ).properties(height=300),
+            width="stretch")
+
+
+def section_analyse(a, run_id):
+    """Section « Analyse des nouvelles lignes » : détail, total, et regroupement par feuille."""
+    st.subheader("Analyse des nouvelles lignes")
+    lignes, par_feuille = a["lignes"], a["par_feuille"]
+    if lignes.empty:
+        st.info("Aucune nouvelle ligne de commande détectée.")
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Nouvelles lignes", len(lignes))
+        m2.metric("Commandes distinctes (NUM_CMDE_AN)", a["nb_commandes"])
+        m3.metric("Montant total PRIX_TOTAL_HT", fmt_montant(a["total_ht"]))
+        if a["nb_sans_montant"]:
+            st.warning(f"{a['nb_sans_montant']} nouvelle(s) ligne(s) sans PRIX_TOTAL_HT : elles ne sont pas dans les sommes.")
+
+    st.markdown("**Par feuille du TB**")
+    synthese = a["synthese_tb"]
+    st.dataframe(
+        synthese, width="stretch", hide_index=True,
+        column_config={
+            "FEUILLE": "Feuille",
+            "NB_COMMANDES": st.column_config.NumberColumn("Commandes distinctes", format="%d"),
+            "TOTAL_HT": st.column_config.NumberColumn("Somme PRIX_TOTAL_HT", format="%.2f"),
+        },
+    )
+    graph = synthese
+    g1, g2 = st.columns(2)
+    with g1:
+        st.markdown("**Répartition du montant PRIX_TOTAL_HT par feuille du TB**")
+        donut = (
+            alt.Chart(graph).mark_arc(innerRadius=70)
+            .encode(
+                theta=alt.Theta("TOTAL_HT:Q"),
+                color=alt.Color("FEUILLE:N", title="Feuille",
+                                legend=alt.Legend(orient="right", labelLimit=220, symbolType="circle")),
+                tooltip=[alt.Tooltip("FEUILLE:N", title="Feuille"),
+                         alt.Tooltip("TOTAL_HT:Q", title="Montant HT", format=",.2f")],
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(donut, width="stretch")
+    with g2:
+        st.markdown("**Top 10 fournisseurs par montant HT**")
+        rattachees = lignes[lignes["FEUILLE"].notna()] if not lignes.empty else lignes   # comme le reste de l'analyse par feuille : sans les commandes hors TB
+        if not rattachees.empty and "NOM" in rattachees.columns and rattachees["NOM"].notna().any():
+            top = (rattachees.assign(NOM=rattachees["NOM"].fillna("(sans fournisseur)"))
+                   .groupby("NOM", as_index=False)
+                   .agg(TOTAL_HT=("PRIX_TOTAL_HT", "sum"), NB_COMMANDES=("NUM_CMDE_AN", "nunique"))
+                   .nlargest(10, "TOTAL_HT"))
+            barres = (
+                alt.Chart(top).mark_bar(color="#1a8cdc")
+                .encode(
+                    y=alt.Y("NOM:N", title=None, sort="-x", axis=alt.Axis(labelLimit=180)),
+                    x=alt.X("TOTAL_HT:Q", title="Montant HT"),
+                    tooltip=[alt.Tooltip("NOM:N", title="Fournisseur"),
+                             alt.Tooltip("TOTAL_HT:Q", title="Montant HT", format=",.2f"),
+                             alt.Tooltip("NB_COMMANDES:Q", title="Commandes", format="d")],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(barres, width="stretch")
+        else:
+            st.info("Aucune donnée fournisseur à afficher pour les lignes rattachées à une feuille du TB.")
+
+    section_indicateurs(a)
+
+    if lignes.empty:
+        return
+    st.markdown("**Détail des nouvelles lignes**")
+    choix = st.multiselect("Filtrer par feuille", list(par_feuille["FEUILLE"]), key=f"flt_feuille_{run_id}")
+    detail = lignes[lignes["FEUILLE"].isin(choix)] if choix else lignes
+    detail = detail.dropna(axis=1, how="all").copy()
+    if "FEUILLE" in detail.columns:
+        detail["FEUILLE"] = detail["FEUILLE"].fillna("—")
+    else:
+        detail.insert(1, "FEUILLE", "—")
+    detail["NUM_CMDE_AN"] = detail["NUM_CMDE_AN"].astype("string")   # évite les soucis d'affichage (types mixtes)
+    st.dataframe(detail, width="stretch", hide_index=True,
+                 column_config={"PRIX_TOTAL_HT": st.column_config.NumberColumn(format="%.2f")})
+
+
 def page_detection():
     n = st.session_state.setdefault("reset_n", 0)
 
     st.title("🔎 Détection : TB et commandes (GMAO)")
     st.caption(
-        "Dépose les deux fichiers d'entrée, lance le contrôle, puis télécharge "
-        "`resultat.xlsx` et `rapprochement_titres_fusionne.xlsx`."
+        "Dépose les deux fichiers d'entrée et lance le contrôle : les résultats s'affichent ici, "
+        "sans fichier à télécharger."
     )
 
     col1, col2 = st.columns(2)
@@ -1279,11 +1573,7 @@ def page_detection():
         m2.metric("Nouvelles lignes", res["nb_nouvelles"])
         m3.metric("Lignes du rapprochement", res["nb_rapprochement"])
 
-        bloc_telechargement("det", [
-            ("⬇️ Télécharger resultat.xlsx", "resultat.xlsx", res["resultat"]),
-            ("⬇️ Télécharger rapprochement_titres_fusionne.xlsx",
-             "rapprochement_titres_fusionne.xlsx", res["rapprochement"]),
-        ])
+        section_analyse(res["analyse"], st.session_state.get("run_id_det"))
 
         st.subheader("Aperçu")
         feuilles = pd.read_excel(io.BytesIO(res["resultat"]), sheet_name=None)
@@ -1295,6 +1585,131 @@ def page_detection():
             st.dataframe(feuilles["Nouvelles lignes"], width="stretch")
         with tab3:
             st.dataframe(rapproch, width="stretch")
+
+
+def _barres_h(df, y, x, titre_x, couleur, tooltips, tri="-x", hauteur=300):
+    """Barres horizontales Altair (utilisé par les graphiques de la page Suivi)."""
+    return st.altair_chart(
+        alt.Chart(df).mark_bar(color=couleur).encode(
+            y=alt.Y(f"{y}:N", title=None, sort=tri, axis=alt.Axis(labelLimit=220)),
+            x=alt.X(f"{x}:Q", title=titre_x, axis=alt.Axis(tickMinStep=1) if titre_x in ("Lignes", "Nombre de lignes") else alt.Axis()),
+            tooltip=tooltips,
+        ).properties(height=hauteur),
+        width="stretch")
+
+
+def graphiques_suivi(res):
+    """Graphiques de la page Suivi : changements, transitions d'état, écarts de montant, nouvelles lignes."""
+    nouvelles, changements = res["nouvelles"].copy(), res["changements"].copy()
+    st.markdown("**Graphiques**")
+
+    # ---------- Ligne 1 : changements par champ | transitions d'état ----------
+    g1, g2 = st.columns(2)
+    with g1:
+        st.markdown("**Changements par champ**")
+        rep = res["stats"]["repartition"]
+        if not rep:
+            st.info("Aucun changement détecté.")
+        else:
+            libelles = {"Etat": "État", "Quantité": "Quantité", "MONTANT BC": "Montant"}
+            df = pd.DataFrame({"CHAMP": [libelles.get(k, k) for k in rep], "NB": list(rep.values())})
+            st.altair_chart(
+                alt.Chart(df).mark_bar().encode(
+                    x=alt.X("CHAMP:N", title=None, sort="-y", axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("NB:Q", title="Lignes", axis=alt.Axis(tickMinStep=1)),
+                    color=alt.Color("CHAMP:N", legend=None, scale=alt.Scale(
+                        domain=["État", "Quantité", "Montant"], range=["#FFC000", "#FFAEC9", "#FF99CC"])),
+                    tooltip=[alt.Tooltip("CHAMP:N", title="Champ"), alt.Tooltip("NB:Q", title="Lignes", format="d")],
+                ).properties(height=300),
+                width="stretch")
+    with g2:
+        st.markdown("**Transitions d'état (suivi → TB)**")
+        etats = changements[changements["Champ"] == "Etat"] if len(changements) else changements
+        if etats.empty:
+            st.info("Aucun changement d'état détecté.")
+        else:
+            def propre(v):
+                return v.astype("string").fillna("").str.strip().str.capitalize().replace("", "(vide)")
+            trans = (propre(etats["Valeur_BDD"]) + " → " + propre(etats["Valeur_TB"])).value_counts().head(10)
+            df = pd.DataFrame({"TRANSITION": trans.index, "NB": trans.values})
+            _barres_h(df, "TRANSITION", "NB", "Lignes", "#8b5cf6",
+                      [alt.Tooltip("TRANSITION:N", title="Transition"), alt.Tooltip("NB:Q", title="Lignes", format="d")])
+
+    # ---------- Ligne 2 : plus gros écarts de montant | évolution mensuelle des nouvelles lignes ----------
+    g3, g4 = st.columns(2)
+    with g3:
+        st.markdown("**Top 10 des écarts de montant**")
+        mt = changements[changements["Champ"] == "MONTANT BC"].copy() if len(changements) else changements
+        if mt.empty:
+            st.info("Aucun changement de montant détecté.")
+        else:
+            mt["SUIVI"] = convertir_numerique(mt["Valeur_BDD"]).fillna(0.0)
+            mt["TB"] = convertir_numerique(mt["Valeur_TB"]).fillna(0.0)
+            mt["ECART"] = mt["TB"] - mt["SUIVI"]
+            mt = mt.reindex(mt["ECART"].abs().sort_values(ascending=False).index).head(10)
+            etiquette = mt["NUM_CMDE_AN"].astype(str) + " · " + mt["TITRE"].astype(str).str.slice(0, 28)
+            mt["LIGNE"] = etiquette + mt.groupby(etiquette).cumcount().map(lambda i: "" if i == 0 else f" ({i + 1})")
+            st.altair_chart(
+                alt.Chart(mt).mark_bar().encode(
+                    y=alt.Y("LIGNE:N", title=None, sort=list(mt["LIGNE"]), axis=alt.Axis(labelLimit=240)),
+                    x=alt.X("ECART:Q", title="Écart (TB − suivi)"),
+                    color=alt.condition(alt.datum.ECART > 0, alt.value("#10b981"), alt.value("#ef4444")),
+                    tooltip=[alt.Tooltip("LIGNE:N", title="Ligne"),
+                             alt.Tooltip("SUIVI:Q", title="Montant suivi", format=",.2f"),
+                             alt.Tooltip("TB:Q", title="Montant TB", format=",.2f"),
+                             alt.Tooltip("ECART:Q", title="Écart", format="+,.2f")],
+                ).properties(height=300),
+                width="stretch")
+            st.caption("Vert : le TB est supérieur au suivi · Rouge : le TB est inférieur au suivi.")
+    with g4:
+        st.markdown("**Évolution mensuelle des nouvelles lignes**")
+        if nouvelles.empty:
+            st.info("Aucune nouvelle ligne.")
+        else:
+            nouvelles["MONTANT"] = convertir_numerique(nouvelles["PRIX_TOTAL_HT"]).fillna(0.0)
+            dates = pd.to_datetime(nouvelles["DATE_CMDE"], errors="coerce")
+            mois = (nouvelles.assign(MOIS=dates.dt.to_period("M").astype(str)).loc[dates.notna()]
+                    .groupby("MOIS", as_index=False)
+                    .agg(MONTANT=("MONTANT", "sum"), NB=("MONTANT", "size")))
+            if mois.empty:
+                st.info("Aucune date de commande exploitable.")
+            else:
+                st.altair_chart(
+                    alt.Chart(mois).mark_bar(color="#10b981").encode(
+                        x=alt.X("MOIS:O", title="Mois de commande", axis=alt.Axis(labelAngle=-30)),
+                        y=alt.Y("MONTANT:Q", title="Montant HT"),
+                        tooltip=[alt.Tooltip("MOIS:O", title="Mois"),
+                                 alt.Tooltip("MONTANT:Q", title="Montant HT", format=",.2f"),
+                                 alt.Tooltip("NB:Q", title="Lignes", format="d")],
+                    ).properties(height=300),
+                    width="stretch")
+
+    # ---------- Ligne 3 : top 10 fournisseurs | nouvelles lignes par état ----------
+    g5, g6 = st.columns(2)
+    with g5:
+        st.markdown("**Top 10 fournisseurs des nouvelles lignes**")
+        if nouvelles.empty or "NOM" not in nouvelles.columns:
+            st.info("Aucune nouvelle ligne.")
+        else:
+            nouvelles["MONTANT"] = convertir_numerique(nouvelles["PRIX_TOTAL_HT"]).fillna(0.0)
+            top = (nouvelles.assign(NOM=nouvelles["NOM"].astype("string").fillna("(sans fournisseur)"))
+                   .groupby("NOM", as_index=False).agg(MONTANT=("MONTANT", "sum"), NB=("MONTANT", "size"))
+                   .nlargest(10, "MONTANT"))
+            _barres_h(top, "NOM", "MONTANT", "Montant HT", "#1a8cdc",
+                      [alt.Tooltip("NOM:N", title="Fournisseur"), alt.Tooltip("MONTANT:Q", title="Montant HT", format=",.2f"),
+                       alt.Tooltip("NB:Q", title="Lignes", format="d")])
+    with g6:
+        st.markdown("**Nouvelles lignes par état de commande**")
+        if nouvelles.empty or "DES_ETAT_CMDE" not in nouvelles.columns:
+            st.info("Aucune nouvelle ligne.")
+        else:
+            nouvelles["MONTANT"] = convertir_numerique(nouvelles["PRIX_TOTAL_HT"]).fillna(0.0)
+            etat = (nouvelles.assign(ETAT=nouvelles["DES_ETAT_CMDE"].astype("string").fillna("(sans état)")
+                                     .str.strip().str.capitalize().replace("", "(sans état)"))
+                    .groupby("ETAT", as_index=False).agg(MONTANT=("MONTANT", "sum"), NB=("MONTANT", "size")))
+            _barres_h(etat, "ETAT", "MONTANT", "Montant HT", "#f97316",
+                      [alt.Tooltip("ETAT:N", title="État"), alt.Tooltip("MONTANT:Q", title="Montant HT", format=",.2f"),
+                       alt.Tooltip("NB:Q", title="Lignes", format="d")])
 
 
 # ==========================================================
@@ -1360,6 +1775,29 @@ def page_suivi():
         m4.metric("Changements", s["changements"])
         if s["repartition"]:
             st.caption("Changements par champ : " + " · ".join(f"{k} : {v}" for k, v in s["repartition"].items()))
+
+        k = s.get("kpi")
+        if k:
+            st.markdown("**Indicateurs**")
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Montant des nouvelles lignes", fmt_montant(k["montant_nouvelles"]),
+                      help="Somme de PRIX_TOTAL_HT des lignes du TB absentes du suivi (à ajouter au suivi).")
+            a2.metric("Écart net de montant", fmt_ecart(k["ecart_montant"]),
+                      help="Somme de (montant TB - montant suivi) sur les lignes dont le montant diffère. "
+                           "Positif : le suivi est inférieur au TB.")
+            a3.metric("Écart net de quantité", fmt_ecart(k["ecart_qte"]),
+                      help="Somme de (quantité TB - quantité suivi) sur les lignes dont la quantité diffère.")
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Commandes touchées", k["commandes_touchees"],
+                      help="Nombre de commandes distinctes ayant au moins un changement.")
+            b2.metric("Taux de lignes en changement", f"{k['taux_changement']:.1f} %".replace(".", ","),
+                      help=f"{k['lignes_en_changement']} ligne(s) distincte(s) avec au moins un changement, "
+                           "divisées par le nombre de lignes du suivi.")
+            gros = k["plus_gros_ecart"]
+            b3.metric("Plus gros écart de montant", fmt_ecart(gros["valeur"]) if gros else "—",
+                      help=f"Commande {gros['commande']}" if gros else "Aucun changement de montant.")
+
+        graphiques_suivi(res)
 
         avertissements = [m for niveau, m in res["journal"] if niveau == "warning"]
         if avertissements:
