@@ -1533,8 +1533,7 @@ def page_detection():
 
     st.title("🔎 Détection : TB et commandes (GMAO)")
     st.caption(
-        "Dépose les deux fichiers d'entrée et lance le contrôle : les résultats s'affichent ici, "
-        "sans fichier à télécharger."
+        "Dépose les deux fichiers d'entrée et lance le contrôle : les résultats s'affichent ici"
     )
 
     col1, col2 = st.columns(2)
